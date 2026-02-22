@@ -311,29 +311,43 @@ EOF
 
 snapshot_good_config() {
     if [[ -f "$OPENCLAW_JSON" ]]; then
-        cp "$OPENCLAW_JSON" "$LAST_GOOD"
+        # Only snapshot if the current config is valid JSON
+        local status
+        status=$(validate_json "$OPENCLAW_JSON" 2>/dev/null) || true
+        if [[ "$status" == VALID* ]]; then
+            cp "$OPENCLAW_JSON" "$LAST_GOOD"
+        else
+            log "WARNING: Skipping snapshot — current config is not valid JSON ($status)"
+        fi
     fi
 }
 
 # ─── Restore from last known good ────────────────────────────────────────────
 
 restore_config() {
-    if [[ ! -f "$LAST_GOOD" ]]; then
-        log "ERROR: No last-known-good backup to restore from!"
-        return 1
-    fi
+    # Try sources in order: last-known-good → openclaw.json.bak
+    local sources=("$LAST_GOOD" "${OPENCLAW_JSON}.bak")
 
-    # Validate the backup itself
-    local backup_status
-    backup_status=$(validate_json "$LAST_GOOD")
-    if [[ "$backup_status" != "VALID" ]]; then
-        log "ERROR: Last-known-good backup is also invalid! ($backup_status)"
-        return 1
-    fi
+    for source in "${sources[@]}"; do
+        if [[ ! -f "$source" ]]; then
+            log "Restore source not found: $source — trying next"
+            continue
+        fi
 
-    cp "$LAST_GOOD" "$OPENCLAW_JSON"
-    log "Restored openclaw.json from last-known-good backup"
-    return 0
+        local backup_status
+        backup_status=$(validate_json "$source")
+        if [[ "$backup_status" != "VALID" ]]; then
+            log "Restore source invalid: $source ($backup_status) — trying next"
+            continue
+        fi
+
+        cp "$source" "$OPENCLAW_JSON"
+        log "Restored openclaw.json from $source"
+        return 0
+    done
+
+    log "ERROR: All restore sources exhausted — no valid backup found!"
+    return 1
 }
 
 # ─── Restart gateway ──────────────────────────────────────────────────────────
@@ -443,54 +457,46 @@ Broken archive: <code>${BROKEN_DIR}/${archive}</code>"
         fi
 
     elif [[ "$json_status" == "MISSING" ]]; then
-        # Config file is missing entirely
+        # Config file is missing entirely — ALWAYS alert immediately
         log "openclaw.json is MISSING!"
-        if (( failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT )); then
-            send_alert "🚨 <code>openclaw.json</code> is MISSING!
+        send_alert "🚨 <code>openclaw.json</code> is MISSING!
 
 Attempting restore from last-known-good backup..."
 
-            if restore_config && restart_gateway; then
-                set_failure_count 0
-                notify_agent "N/A" "Config file was missing entirely — restored from backup"
-                send_alert "✅ Restored missing config from backup. Gateway is back up."
-            else
-                send_alert "❌ Could not restore config. Manual intervention needed."
-            fi
+        if restore_config && restart_gateway; then
+            set_failure_count 0
+            notify_agent "N/A" "Config file was missing entirely — restored from backup"
+            send_alert "✅ Restored missing config from backup. Gateway is back up."
+        else
+            send_alert "❌ Could not restore config. Manual intervention needed."
         fi
 
     else
-        # Config is corrupt/invalid JSON
+        # Config is corrupt/invalid JSON — ALWAYS alert immediately (don't wait for consecutive failures)
         log "openclaw.json is CORRUPT: $json_status"
 
         local archive
         archive=$(archive_broken_config "$OPENCLAW_JSON" "invalid-json: $json_status")
 
-        if (( failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT )); then
-            send_alert "🚨 <code>openclaw.json</code> is corrupt!
+        send_alert "🚨 <code>openclaw.json</code> is corrupt!
 
 <b>Error:</b> ${json_status}
 <b>Archived as:</b> <code>${archive}</code>
 
 Attempting restore from last-known-good backup..."
-        fi
 
         if restore_config && restart_gateway; then
             set_failure_count 0
             notify_agent "$archive" "Corrupt JSON: $json_status"
-            if (( failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT )); then
-                send_alert "✅ Restored from backup and gateway is back up.
+            send_alert "✅ Restored from backup and gateway is back up.
 
 Review the broken config at:
 <code>${BROKEN_DIR}/${archive}</code>"
-            fi
         else
-            if (( failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT )); then
-                send_alert "❌ Restore failed or gateway still won't start. Manual intervention needed.
+            send_alert "❌ Restore failed or gateway still won't start. Manual intervention needed.
 
 Broken config archived at: <code>${BROKEN_DIR}/${archive}</code>
 Last-known-good: <code>${LAST_GOOD}</code>"
-            fi
         fi
     fi
 
