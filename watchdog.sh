@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# openclaw-watchdog — Config Guardian + Health Monitor
-# 
-# Standalone health checker for OpenClaw gateway. Runs outside OpenClaw so it
-# can detect and fix problems even when the gateway is completely down.
+# openclaw-watchdog v1.0.0
+# Config Guardian + Health Monitor for OpenClaw Gateway
+#
+# Standalone health checker that runs OUTSIDE OpenClaw so it can detect and
+# fix problems even when the gateway is completely down.
 #
 # Features:
 #   - Pings gateway health endpoint every cycle
 #   - On failure: validates openclaw.json, archives broken configs with
 #     numbered versions for forensic review, restores last known good
-#   - Alerts via Telegram bot API (no OpenClaw dependency)
+#   - Optional alerts via Telegram bot API (no OpenClaw dependency)
 #   - Snapshots "last known good" config after every successful check
-#   - Configurable via environment or config file
+#   - Configurable via environment, config file, or CLI flags
 #
 # Usage:
-#   ./watchdog.sh                    # Run once (for systemd timer)
+#   ./watchdog.sh                    # Run once (for systemd timer / cron)
 #   ./watchdog.sh --loop             # Run continuously (for systemd service)
 #   ./watchdog.sh --check            # Dry run — report status, don't fix
 #   ./watchdog.sh --history          # Show broken config archive
+#   ./watchdog.sh --version          # Show version
 #
 # Config: ~/.openclaw/watchdog.conf (or WATCHDOG_CONF env var)
+#
+# Repository: https://github.com/swift-innovate/openclaw-watchdog
+# License: MIT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
+
+VERSION="1.0.0"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -36,6 +43,7 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 MAX_BROKEN_ARCHIVES="${MAX_BROKEN_ARCHIVES:-50}"
+MAX_LOG_BYTES="${MAX_LOG_BYTES:-1048576}"  # 1MB log rotation threshold
 RESTART_CMD="${RESTART_CMD:-systemctl --user restart openclaw-gateway.service 2>/dev/null || openclaw gateway restart 2>/dev/null}"
 CONSECUTIVE_FAILURES_BEFORE_ALERT="${CONSECUTIVE_FAILURES_BEFORE_ALERT:-2}"
 LOG_FILE="${LOG_FILE:-$HOME/.openclaw/watchdog/watchdog.log}"
@@ -58,8 +66,29 @@ for arg in "$@"; do
         --check)    DRY_RUN=true ;;
         --loop)     LOOP_MODE=true ;;
         --history)  SHOW_HISTORY=true ;;
+        --version|-v)
+            echo "openclaw-watchdog v${VERSION}"
+            exit 0 ;;
         --help|-h)
-            echo "Usage: watchdog.sh [--loop|--check|--history|--help]"
+            cat <<'HELP'
+openclaw-watchdog — Config Guardian + Health Monitor for OpenClaw
+
+Usage:
+  watchdog.sh [OPTIONS]
+
+Options:
+  --loop        Run continuously (for systemd service)
+  --check       Dry run — report status, don't fix anything
+  --history     Show broken config archive with metadata
+  --version     Show version
+  --help        Show this help
+
+Configuration:
+  Place a config file at ~/.openclaw/watchdog.conf or set WATCHDOG_CONF
+  to a custom path. All settings can also be set via environment variables.
+
+  See README.md for full configuration reference.
+HELP
             exit 0 ;;
     esac
 done
@@ -73,6 +102,17 @@ log() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$ts] $*" | tee -a "$LOG_FILE"
+}
+
+rotate_log() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local size
+        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if (( size > MAX_LOG_BYTES )); then
+            mv "$LOG_FILE" "${LOG_FILE}.1"
+            log "Log rotated (previous log at ${LOG_FILE}.1)"
+        fi
+    fi
 }
 
 get_failure_count() {
@@ -136,34 +176,37 @@ validate_json() {
         return 1
     fi
 
-    # Try node first (more detailed), fall back to python
+    # Use node or python3 for safe JSON validation (file path passed as arg, not interpolated)
     if command -v node &>/dev/null; then
         local result
-        result=$(node -e "
+        result=$(node -e '
+            const fs = require("fs");
             try {
-                const fs = require('fs');
-                JSON.parse(fs.readFileSync('$file', 'utf-8'));
-                console.log('VALID');
+                JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
+                console.log("VALID");
             } catch(e) {
-                console.log('INVALID: ' + e.message);
+                console.log("INVALID: " + e.message);
             }
-        " 2>/dev/null)
+        ' "$file" 2>/dev/null)
         echo "$result"
         [[ "$result" == "VALID" ]]
     elif command -v python3 &>/dev/null; then
-        python3 -c "
+        local result
+        result=$(python3 -c '
 import json, sys
 try:
-    json.load(open('$file'))
-    print('VALID')
+    json.load(open(sys.argv[1]))
+    print("VALID")
 except Exception as e:
-    print(f'INVALID: {e}')
+    print(f"INVALID: {e}")
     sys.exit(1)
-" 2>/dev/null
+' "$file" 2>/dev/null)
+        echo "$result"
+        [[ "$result" == "VALID" ]]
     else
-        # Last resort — just check it's non-empty and starts with {
+        # Last resort — basic structural check
         if [[ -s "$file" ]] && head -c1 "$file" | grep -q '{'; then
-            echo "VALID (basic check only)"
+            echo "VALID (basic check only — install node or python3 for full validation)"
             return 0
         else
             echo "INVALID: empty or not JSON"
@@ -185,9 +228,11 @@ archive_broken_config() {
         next_num=$((next_num + 1))
     fi
 
-    local archive_name="broken-$(printf '%04d' "$next_num").json"
+    local padded
+    padded=$(printf '%04d' "$next_num")
+    local archive_name="broken-${padded}.json"
     local archive_path="$BROKEN_DIR/$archive_name"
-    local meta_path="$BROKEN_DIR/broken-$(printf '%04d' "$next_num").meta"
+    local meta_path="$BROKEN_DIR/broken-${padded}.meta"
 
     cp "$source" "$archive_path"
 
@@ -200,6 +245,7 @@ validation: $(validate_json "$source" 2>/dev/null || echo "failed")
 gateway_url: $GATEWAY_URL
 openclaw_json: $OPENCLAW_JSON
 restored_from: $LAST_GOOD
+watchdog_version: $VERSION
 EOF
 
     log "Archived broken config as $archive_name (reason: $reason)"
@@ -265,7 +311,7 @@ restart_gateway() {
 # ─── Show history ─────────────────────────────────────────────────────────────
 
 if $SHOW_HISTORY; then
-    echo "═══ Broken Config Archive ═══"
+    echo "═══ OpenClaw Watchdog — Broken Config Archive ═══"
     echo "Location: $BROKEN_DIR"
     echo ""
     if ls "$BROKEN_DIR"/broken-*.meta 1>/dev/null 2>&1; then
@@ -275,8 +321,11 @@ if $SHOW_HISTORY; then
             cat "$meta"
             echo ""
         done
+        local total
+        total=$(ls "$BROKEN_DIR"/broken-*.json 2>/dev/null | wc -l)
+        echo "Total: $total archived configs (max: $MAX_BROKEN_ARCHIVES)"
     else
-        echo "No broken configs archived yet."
+        echo "No broken configs archived yet. That's a good thing."
     fi
     exit 0
 fi
@@ -405,8 +454,9 @@ Last-known-good: <code>${LAST_GOOD}</code>"
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if $LOOP_MODE; then
-    log "Watchdog starting in loop mode (interval: ${CHECK_INTERVAL}s)"
+    log "Watchdog v${VERSION} starting in loop mode (interval: ${CHECK_INTERVAL}s)"
     while true; do
+        rotate_log
         run_check || true
         sleep "$CHECK_INTERVAL"
     done

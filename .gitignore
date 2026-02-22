@@ -1,1 +1,5 @@
+# Logs
 *.log
+
+# Real config (contains secrets) — only the example is committed
+watchdog.conf

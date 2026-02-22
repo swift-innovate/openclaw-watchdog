@@ -1,78 +1,139 @@
 # openclaw-watchdog
 
-Config Guardian + Health Monitor for OpenClaw Gateway.
+Config Guardian + Health Monitor for [OpenClaw](https://github.com/openclaw/openclaw) Gateway.
 
-Standalone watchdog that runs **outside** OpenClaw — detects gateway failures, diagnoses config corruption, archives broken configs with numbered versions for forensic review, restores from last-known-good backups, and alerts via Telegram.
+A standalone watchdog that runs **outside** OpenClaw — detects gateway failures, diagnoses config corruption, archives broken configs with numbered versions for forensic review, restores from last-known-good backups, and alerts via Telegram.
 
 ## The Problem
 
-OpenClaw's `openclaw.json` config can get corrupted by bad patches (e.g., plugin configs, model changes). When this happens:
+OpenClaw's `openclaw.json` config can get corrupted by bad patches, plugin installs, or manual edits. When this happens:
 
-1. Gateway won't start
-2. The agent is completely dead — can't self-diagnose
-3. Manual intervention required every time
-4. No record of what broke
+1. The gateway won't start
+2. Your agent is completely dead — it can't self-diagnose or self-heal
+3. There's no record of what the config looked like when it broke
+4. Manual SSH + fix required every time
 
 ## The Solution
 
-A lightweight bash watchdog that:
+A single bash script with zero dependencies (beyond `curl` and `node` or `python3`) that:
 
-- **Monitors** gateway health every 60s via HTTP ping
-- **Detects** config corruption (JSON parse errors, missing files)
-- **Archives** broken configs as numbered versions (`broken-0001.json` + `.meta`) for forensic review
-- **Restores** from last-known-good backup automatically
+- **Monitors** gateway health every 60s via HTTP
+- **Detects** config corruption (invalid JSON, missing file)
+- **Archives** every broken config as a numbered file (`broken-0001.json`) with metadata — forensic trail for debugging
+- **Restores** automatically from the last-known-good backup
 - **Restarts** the gateway after restoration
 - **Alerts** via Telegram bot API (completely independent of OpenClaw)
 - **Snapshots** the config after every successful health check
 
+## Quick Start
+
+```bash
+# 1. Clone
+git clone https://github.com/swift-innovate/openclaw-watchdog.git
+cd openclaw-watchdog
+
+# 2. Create your config
+cp watchdog.example.conf ~/.openclaw/watchdog.conf
+# Edit ~/.openclaw/watchdog.conf with your settings
+
+# 3. Test it
+./watchdog.sh --check
+
+# 4. Run it
+./watchdog.sh --loop
+```
+
+## Installation (systemd)
+
+```bash
+# Create a systemd user service
+cat > ~/.config/systemd/user/openclaw-watchdog.service << EOF
+[Unit]
+Description=OpenClaw Watchdog — Config Guardian + Health Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$(pwd)/watchdog.sh --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now openclaw-watchdog.service
+```
+
+## How It Works
+
+```
+Every 60 seconds:
+  └─ Ping gateway /api/health
+     ├─ 2xx → Healthy
+     │        └─ Snapshot config as "last-known-good"
+     │
+     └─ Down → Validate openclaw.json
+              ├─ Valid JSON → Restart gateway
+              │               ├─ Back up? → Done ✅
+              │               └─ Still down? → Archive config → Restore backup → Restart → Alert
+              │
+              ├─ Invalid JSON → Archive broken config → Restore backup → Restart → Alert
+              │
+              └─ Missing → Restore backup → Restart → Alert
+```
+
+Anti-flap: waits for 2 consecutive failures before taking action (configurable).
+
 ## Archive Structure
+
+Every broken config gets archived with a numbered filename and metadata:
 
 ```
 ~/.openclaw/watchdog/
 ├── last-known-good.json          # Auto-snapshotted on every healthy check
-├── watchdog.log                  # Activity log
-├── .consecutive_failures         # Failure counter
+├── watchdog.log                  # Activity log (auto-rotated at 1MB)
 └── broken/
-    ├── broken-0001.json          # First broken config
-    ├── broken-0001.meta          # Metadata (timestamp, error, reason)
-    ├── broken-0002.json          # Second broken config
+    ├── broken-0001.json          # The broken config (exact copy)
+    ├── broken-0001.meta          # Metadata for forensics
+    ├── broken-0002.json
     ├── broken-0002.meta
-    └── ...                       # Up to 50 archived (configurable)
+    └── ...
 ```
 
-Each `.meta` file contains:
-```
+Each `.meta` file records:
+```yaml
 timestamp: 2026-02-22T06:15:00-06:00
-hostname: mirapc
+hostname: myserver
 reason: invalid-json: Unexpected token } in JSON at position 1234
 validation: INVALID: Unexpected token } in JSON at position 1234
 gateway_url: http://localhost:18789
-openclaw_json: /home/mira/.openclaw/openclaw.json
-restored_from: /home/mira/.openclaw/watchdog/last-known-good.json
+openclaw_json: /home/user/.openclaw/openclaw.json
+restored_from: /home/user/.openclaw/watchdog/last-known-good.json
+watchdog_version: 1.0.0
 ```
 
-## Installation
+This lets you go back and see exactly what broke, when, and why — instead of losing the evidence when the config gets overwritten.
 
-```bash
-# 1. Copy watchdog.sh somewhere persistent
-cp watchdog.sh /path/to/openclaw-watchdog/
+## Configuration
 
-# 2. Create config
-cat > ~/.openclaw/watchdog.conf << 'EOF'
-GATEWAY_URL="http://localhost:18789"
-OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
-TELEGRAM_BOT_TOKEN="your-bot-token"
-TELEGRAM_CHAT_ID="your-chat-id"
-CHECK_INTERVAL=60
-CONSECUTIVE_FAILURES_BEFORE_ALERT=2
-MAX_BROKEN_ARCHIVES=50
-EOF
+Copy `watchdog.example.conf` to `~/.openclaw/watchdog.conf`:
 
-# 3. Install systemd service
-cp openclaw-watchdog.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now openclaw-watchdog.service
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_URL` | `http://localhost:18789` | Gateway base URL |
+| `HEALTH_ENDPOINT` | `/api/health` | Health check path |
+| `OPENCLAW_JSON` | `~/.openclaw/openclaw.json` | Config file to monitor |
+| `TELEGRAM_BOT_TOKEN` | *(none)* | Bot token for alerts (optional) |
+| `TELEGRAM_CHAT_ID` | *(none)* | Chat ID for alerts (optional) |
+| `CHECK_INTERVAL` | `60` | Seconds between checks |
+| `CONSECUTIVE_FAILURES_BEFORE_ALERT` | `2` | Anti-flap threshold |
+| `MAX_BROKEN_ARCHIVES` | `50` | Max broken configs to keep |
+| `MAX_LOG_BYTES` | `1048576` | Log rotation threshold (1MB) |
+| `RESTART_CMD` | `systemctl --user restart...` | Gateway restart command |
+
+All settings can also be set via environment variables.
 
 ## Usage
 
@@ -88,34 +149,28 @@ systemctl --user enable --now openclaw-watchdog.service
 
 # Show broken config archive history
 ./watchdog.sh --history
+
+# Show version
+./watchdog.sh --version
 ```
-
-## Configuration
-
-All settings via `~/.openclaw/watchdog.conf` or environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_URL` | `http://localhost:18789` | Gateway health endpoint base URL |
-| `OPENCLAW_JSON` | `~/.openclaw/openclaw.json` | Path to config file |
-| `TELEGRAM_BOT_TOKEN` | *(none)* | Bot token for alerts |
-| `TELEGRAM_CHAT_ID` | *(none)* | Chat ID for alerts |
-| `CHECK_INTERVAL` | `60` | Seconds between checks (loop mode) |
-| `CONSECUTIVE_FAILURES_BEFORE_ALERT` | `2` | Anti-flap: failures before alerting |
-| `MAX_BROKEN_ARCHIVES` | `50` | Max broken configs to keep |
-| `RESTART_CMD` | `systemctl --user restart...` | Command to restart gateway |
 
 ## Requirements
 
-- bash 4+
-- curl
-- node or python3 (for JSON validation)
-- systemd (optional, for service mode)
+- **bash** 4+
+- **curl** (for health checks and Telegram alerts)
+- **node** or **python3** (for JSON validation — falls back to basic check if neither available)
+- **systemd** (optional, for persistent service mode)
 
-## Multi-Instance
+## Security Notes
 
-Works for multiple OpenClaw instances — each gets its own `watchdog.conf` pointing to its gateway port and config path. Deploy on every machine running OpenClaw.
+- The config file (`watchdog.conf`) contains your Telegram bot token — keep it readable only by your user (`chmod 600`)
+- The `RESTART_CMD` is executed via `eval` — only set this in config files you control
+- No network access beyond the gateway health endpoint and Telegram API (when configured)
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+## Credits
+
+Built by [Swift Innovative Technologies](https://swiftinnovate.tech) for the [OpenClaw](https://github.com/openclaw/openclaw) community.
