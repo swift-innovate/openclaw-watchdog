@@ -23,6 +23,7 @@ A single bash script with zero dependencies (beyond `curl` and `node` or `python
 - **Restores** automatically from the last-known-good backup
 - **Restarts** the gateway after restoration
 - **Alerts** via Telegram bot API (completely independent of OpenClaw)
+- **Notifies the agent** via MEMORY.md so it knows what happened and doesn't retry the same broken change
 - **Snapshots** the config after every successful health check
 
 ## Quick Start
@@ -116,6 +117,30 @@ watchdog_version: 1.0.0
 
 This lets you go back and see exactly what broke, when, and why — instead of losing the evidence when the config gets overwritten.
 
+## Agent Notification (Break the Retry Loop)
+
+When the watchdog recovers from a crash, it can write a note to the agent's `MEMORY.md`:
+
+```markdown
+## ⚠️ Watchdog Recovery — 2026-02-22 06:15:00 CST
+
+**The gateway crashed and was automatically recovered by openclaw-watchdog.**
+
+- **Reason:** Corrupt JSON: Unexpected token } at position 1234
+- **Broken config archived as:** `broken-0003.json`
+
+**DO NOT retry the same config change that caused this crash.**
+```
+
+This prevents the classic loop: agent makes bad patch → gateway dies → watchdog restores → agent wakes up and retries the same patch → dies again.
+
+Configure with `AGENT_MEMORY` in your config:
+```bash
+AGENT_MEMORY="$HOME/.openclaw/workspace/MEMORY.md"
+```
+
+A dedicated recovery log is also always written to `~/.openclaw/watchdog/last-recovery.md` — add a check for this in your agent's heartbeat routine.
+
 ## Configuration
 
 Copy `watchdog.example.conf` to `~/.openclaw/watchdog.conf`:
@@ -131,6 +156,8 @@ Copy `watchdog.example.conf` to `~/.openclaw/watchdog.conf`:
 | `CONSECUTIVE_FAILURES_BEFORE_ALERT` | `2` | Anti-flap threshold |
 | `MAX_BROKEN_ARCHIVES` | `50` | Max broken configs to keep |
 | `MAX_LOG_BYTES` | `1048576` | Log rotation threshold (1MB) |
+| `RECOVERY_LOG` | `~/.openclaw/watchdog/last-recovery.md` | Recovery note (overwritten each recovery) |
+| `AGENT_MEMORY` | *(none)* | Path to agent's MEMORY.md (optional, appended) |
 | `RESTART_CMD` | `systemctl --user restart...` | Gateway restart command |
 
 All settings can also be set via environment variables.

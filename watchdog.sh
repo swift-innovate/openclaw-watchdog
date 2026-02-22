@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -47,6 +47,8 @@ MAX_LOG_BYTES="${MAX_LOG_BYTES:-1048576}"  # 1MB log rotation threshold
 RESTART_CMD="${RESTART_CMD:-systemctl --user restart openclaw-gateway.service 2>/dev/null || openclaw gateway restart 2>/dev/null}"
 CONSECUTIVE_FAILURES_BEFORE_ALERT="${CONSECUTIVE_FAILURES_BEFORE_ALERT:-2}"
 LOG_FILE="${LOG_FILE:-$HOME/.openclaw/watchdog/watchdog.log}"
+RECOVERY_LOG="${RECOVERY_LOG:-$HOME/.openclaw/watchdog/last-recovery.md}"
+AGENT_MEMORY="${AGENT_MEMORY:-}"  # Optional: path to agent's MEMORY.md to append recovery notes
 DRY_RUN=false
 LOOP_MODE=false
 SHOW_HISTORY=false
@@ -150,6 +152,47 @@ ${message}
         -d "parse_mode=HTML" \
         --data-urlencode "text=${full_msg}" \
         > /dev/null 2>&1 || log "WARNING: Failed to send Telegram alert"
+}
+
+# ─── Agent memory notification ────────────────────────────────────────────────
+# Writes a recovery note so the agent knows what happened and doesn't retry
+# the same broken change. Writes to both a dedicated recovery log and
+# optionally appends to the agent's MEMORY.md.
+
+notify_agent() {
+    local archive_name="$1"
+    local reason="$2"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    local note="## ⚠️ Watchdog Recovery — ${ts}
+
+**The gateway crashed and was automatically recovered by openclaw-watchdog.**
+
+- **Reason:** ${reason}
+- **Broken config archived as:** \`${archive_name}\`
+- **Archive location:** \`${BROKEN_DIR}/${archive_name}\`
+- **Restored from:** \`${LAST_GOOD}\`
+
+**DO NOT retry the same config change that caused this crash.**
+Review the broken config archive to understand what went wrong before attempting similar changes.
+To inspect: \`./watchdog.sh --history\` or read \`${BROKEN_DIR}/${archive_name%.json}.meta\`
+
+---
+"
+
+    # Always write to dedicated recovery log (overwritten each time — latest recovery only)
+    echo "$note" > "$RECOVERY_LOG"
+    log "Wrote recovery note to $RECOVERY_LOG"
+
+    # Optionally append to agent's MEMORY.md
+    if [[ -n "$AGENT_MEMORY" && -f "$AGENT_MEMORY" ]]; then
+        echo "" >> "$AGENT_MEMORY"
+        echo "$note" >> "$AGENT_MEMORY"
+        log "Appended recovery note to $AGENT_MEMORY"
+    elif [[ -n "$AGENT_MEMORY" && ! -f "$AGENT_MEMORY" ]]; then
+        log "WARNING: AGENT_MEMORY set to $AGENT_MEMORY but file does not exist — skipping"
+    fi
 }
 
 # ─── Health check ─────────────────────────────────────────────────────────────
@@ -389,6 +432,7 @@ Attempting restore from last-known-good backup..."
 
             if restore_config && restart_gateway; then
                 set_failure_count 0
+                notify_agent "$archive" "Valid JSON but gateway would not start — likely bad config values"
                 send_alert "✅ Restored from last-known-good and gateway is back up."
             else
                 send_alert "❌ Restore failed or gateway still won't start. Manual intervention needed.
@@ -408,6 +452,7 @@ Attempting restore from last-known-good backup..."
 
             if restore_config && restart_gateway; then
                 set_failure_count 0
+                notify_agent "N/A" "Config file was missing entirely — restored from backup"
                 send_alert "✅ Restored missing config from backup. Gateway is back up."
             else
                 send_alert "❌ Could not restore config. Manual intervention needed."
@@ -432,6 +477,7 @@ Attempting restore from last-known-good backup..."
 
         if restore_config && restart_gateway; then
             set_failure_count 0
+            notify_agent "$archive" "Corrupt JSON: $json_status"
             if (( failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT )); then
                 send_alert "✅ Restored from backup and gateway is back up.
 
