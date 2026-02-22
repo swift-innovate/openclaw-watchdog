@@ -20,11 +20,11 @@ A single bash script with zero dependencies (beyond `curl` and `node` or `python
 - **Monitors** gateway health every 60s via HTTP
 - **Detects** config corruption (invalid JSON, missing file)
 - **Archives** every broken config as a numbered file (`broken-0001.json`) with metadata — forensic trail for debugging
-- **Restores** automatically from the last-known-good backup
+- **Restores** automatically from the last-known-good backup (falls back to `openclaw.json.bak` if needed)
 - **Restarts** the gateway after restoration
 - **Alerts** via Telegram bot API (completely independent of OpenClaw)
 - **Notifies the agent** via MEMORY.md so it knows what happened and doesn't retry the same broken change
-- **Snapshots** the config after every successful health check
+- **Snapshots** the config after every successful health check (validates JSON before snapshotting)
 
 ## Quick Start
 
@@ -73,19 +73,19 @@ systemctl --user enable --now openclaw-watchdog.service
 Every 60 seconds:
   └─ Ping gateway /api/health
      ├─ 2xx → Healthy
-     │        └─ Snapshot config as "last-known-good"
+     │        └─ Validate JSON → if valid, snapshot as "last-known-good"
      │
      └─ Down → Validate openclaw.json
               ├─ Valid JSON → Restart gateway
               │               ├─ Back up? → Done ✅
               │               └─ Still down? → Archive config → Restore backup → Restart → Alert
               │
-              ├─ Invalid JSON → Archive broken config → Restore backup → Restart → Alert
+              ├─ Invalid JSON → Archive → Restore (last-known-good → .bak fallback) → Restart → Alert 🚨
               │
-              └─ Missing → Restore backup → Restart → Alert
+              └─ Missing → Restore (last-known-good → .bak fallback) → Restart → Alert 🚨
 ```
 
-Anti-flap: waits for 2 consecutive failures before taking action (configurable).
+Anti-flap: waits for 2 consecutive failures before alerting on transient issues (configurable). Corrupt or missing configs trigger **immediate** alerts and recovery on first detection.
 
 ## Archive Structure
 
@@ -112,7 +112,7 @@ validation: INVALID: Unexpected token } in JSON at position 1234
 gateway_url: http://localhost:18789
 openclaw_json: /home/user/.openclaw/openclaw.json
 restored_from: /home/user/.openclaw/watchdog/last-known-good.json
-watchdog_version: 1.0.0
+watchdog_version: 1.1.0
 ```
 
 This lets you go back and see exactly what broke, when, and why — instead of losing the evidence when the config gets overwritten.
@@ -153,7 +153,7 @@ Copy `watchdog.example.conf` to `~/.openclaw/watchdog.conf`:
 | `TELEGRAM_BOT_TOKEN` | *(none)* | Bot token for alerts (optional) |
 | `TELEGRAM_CHAT_ID` | *(none)* | Chat ID for alerts (optional) |
 | `CHECK_INTERVAL` | `60` | Seconds between checks |
-| `CONSECUTIVE_FAILURES_BEFORE_ALERT` | `2` | Anti-flap threshold |
+| `CONSECUTIVE_FAILURES_BEFORE_ALERT` | `2` | Anti-flap threshold (transient failures only; corrupt/missing configs always alert immediately) |
 | `MAX_BROKEN_ARCHIVES` | `50` | Max broken configs to keep |
 | `MAX_LOG_BYTES` | `1048576` | Log rotation threshold (1MB) |
 | `RECOVERY_LOG` | `~/.openclaw/watchdog/last-recovery.md` | Recovery note (overwritten each recovery) |
