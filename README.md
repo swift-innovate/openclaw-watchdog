@@ -26,6 +26,15 @@ A single bash script with zero dependencies (beyond `curl` and `node` or `python
 - **Notifies the agent** via MEMORY.md so it knows what happened and doesn't retry the same broken change
 - **Snapshots** the config after every successful health check (validates JSON before snapshotting)
 
+## Features
+
+- ✅ **Auto-updates** from git repo (checks hourly, pulls latest, restarts service)
+- ✅ **Smart health checks** using `openclaw health` command (works with OpenClaw 2026.3.1+)
+- ✅ **Failure limit** — exits after 3 consecutive recovery failures (prevents endless loops)
+- ✅ **Forensic archives** — numbered broken config backups with metadata
+- ✅ **Agent notifications** — writes recovery notes to MEMORY.md
+- ✅ **Telegram alerts** — optional bot notifications
+
 ## Quick Start
 
 ```bash
@@ -181,11 +190,87 @@ All settings can also be set via environment variables.
 ./watchdog.sh --version
 ```
 
+## Auto-Update
+
+The watchdog automatically checks for updates from the git repo every hour (configurable via `UPDATE_CHECK_INTERVAL`).
+
+When an update is available:
+1. Fetches latest from `origin/master` or `origin/main`
+2. Pulls and applies the update
+3. Sends Telegram alert (if configured)
+4. Restarts itself (in loop mode)
+
+To disable auto-updates:
+```bash
+AUTO_UPDATE=false ./watchdog.sh --loop
+```
+
+Or in your config file:
+```bash
+AUTO_UPDATE=false
+```
+
+## Troubleshooting
+
+### Service keeps stopping after 3 failures
+
+The watchdog has a safety limit of 3 consecutive failures before it exits. This prevents endless recovery loops.
+
+**Common causes:**
+1. **`openclaw` not in PATH** — The systemd service environment doesn't inherit your shell PATH
+   - **Fix:** The watchdog auto-detects openclaw in NVM paths, but if it fails, add to service file:
+     ```
+     Environment=PATH=/home/youruser/.nvm/versions/node/v24.13.1/bin:/usr/bin:/bin
+     ```
+
+2. **Gateway won't start with any config** — Underlying issue with OpenClaw itself
+   - **Check logs:** `journalctl --user -u openclaw-gateway -n 50`
+   - **Manual test:** `openclaw gateway restart`
+
+3. **Plugin conflicts** — Plugin warnings being treated as errors
+   - **Already handled** in v1.2.3+ — health check suppresses plugin warnings
+
+### How to stop and remove the service
+
+```bash
+# Stop the service
+systemctl --user stop openclaw-watchdog
+
+# Disable auto-start
+systemctl --user disable openclaw-watchdog
+
+# Remove the service file
+rm ~/.config/systemd/user/openclaw-watchdog.service
+systemctl --user daemon-reload
+```
+
+### Reset failure counter
+
+If you've fixed the underlying issue and want to reset:
+
+```bash
+rm ~/.openclaw/watchdog/.consecutive_failures
+```
+
+### View recovery history
+
+```bash
+# Show archived broken configs
+./watchdog.sh --history
+
+# Check the log
+tail -f ~/.openclaw/watchdog/watchdog.log
+
+# See last recovery details
+cat ~/.openclaw/watchdog/last-recovery.md
+```
+
 ## Requirements
 
 - **bash** 4+
-- **curl** (for health checks and Telegram alerts)
+- **OpenClaw** 2026.3.1+ (uses `openclaw health` command)
 - **node** or **python3** (for JSON validation — falls back to basic check if neither available)
+- **git** (optional, for auto-updates)
 - **systemd** (optional, for persistent service mode)
 
 ## Security Notes

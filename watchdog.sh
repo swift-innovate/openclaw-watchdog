@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# openclaw-watchdog v1.0.0
+# openclaw-watchdog v1.2.0
 # Config Guardian + Health Monitor for OpenClaw Gateway
 #
 # Standalone health checker that runs OUTSIDE OpenClaw so it can detect and
 # fix problems even when the gateway is completely down.
 #
 # Features:
-#   - Pings gateway health endpoint every cycle
+#   - Pings gateway health endpoint every cycle (using openclaw health command)
 #   - On failure: validates openclaw.json, archives broken configs with
 #     numbered versions for forensic review, restores last known good
 #   - Optional alerts via Telegram bot API (no OpenClaw dependency)
 #   - Snapshots "last known good" config after every successful check
+#   - Auto-updates from git repo (hourly check by default)
 #   - Configurable via environment, config file, or CLI flags
 #
 # Usage:
@@ -29,7 +30,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.3"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -46,9 +47,12 @@ MAX_BROKEN_ARCHIVES="${MAX_BROKEN_ARCHIVES:-50}"
 MAX_LOG_BYTES="${MAX_LOG_BYTES:-1048576}"  # 1MB log rotation threshold
 RESTART_CMD="${RESTART_CMD:-systemctl --user restart openclaw-gateway.service 2>/dev/null || openclaw gateway restart 2>/dev/null}"
 CONSECUTIVE_FAILURES_BEFORE_ALERT="${CONSECUTIVE_FAILURES_BEFORE_ALERT:-2}"
+MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"  # Exit loop after this many failures
 LOG_FILE="${LOG_FILE:-$HOME/.openclaw/watchdog/watchdog.log}"
 RECOVERY_LOG="${RECOVERY_LOG:-$HOME/.openclaw/watchdog/last-recovery.md}"
 AGENT_MEMORY="${AGENT_MEMORY:-}"  # Optional: path to agent's MEMORY.md to append recovery notes
+AUTO_UPDATE="${AUTO_UPDATE:-true}"  # Auto-update from git repo
+UPDATE_CHECK_INTERVAL="${UPDATE_CHECK_INTERVAL:-3600}"  # Check for updates every hour
 DRY_RUN=false
 LOOP_MODE=false
 SHOW_HISTORY=false
@@ -198,14 +202,79 @@ To inspect: \`./watchdog.sh --history\` or read \`${BROKEN_DIR}/${archive_name%.
 # ─── Health check ─────────────────────────────────────────────────────────────
 
 check_gateway_health() {
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        --connect-timeout 5 --max-time 10 \
-        "${GATEWAY_URL}${HEALTH_ENDPOINT}" 2>/dev/null) || http_code="000"
-
-    if [[ "$http_code" =~ ^2 ]]; then
+    # Use openclaw health command instead of HTTP endpoint
+    # (OpenClaw 2026.3.1 removed /api/health endpoint)
+    # Redirect all output including plugin warnings
+    
+    # Find openclaw binary (may not be in PATH when running as systemd service)
+    local openclaw_bin
+    if command -v openclaw &>/dev/null; then
+        openclaw_bin="openclaw"
+    elif [[ -x "$HOME/.nvm/versions/node/v24.13.1/bin/openclaw" ]]; then
+        openclaw_bin="$HOME/.nvm/versions/node/v24.13.1/bin/openclaw"
+    else
+        # Fallback: try to find it
+        openclaw_bin=$(find "$HOME/.nvm/versions/node" -name openclaw -type f -executable 2>/dev/null | head -1)
+        if [[ -z "$openclaw_bin" ]]; then
+            log "ERROR: Cannot find openclaw binary"
+            return 1
+        fi
+    fi
+    
+    if $openclaw_bin health >/dev/null 2>&1; then
         return 0
     else
+        return 1
+    fi
+}
+
+# ─── Auto-update from git repo ────────────────────────────────────────────────
+
+check_and_update() {
+    if [[ "$AUTO_UPDATE" != "true" ]]; then
+        return 0
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # Only update if we're in a git repo
+    if [[ ! -d "$script_dir/.git" ]]; then
+        return 0
+    fi
+
+    cd "$script_dir" || return 1
+
+    # Fetch latest from remote
+    if ! git fetch origin &>/dev/null; then
+        log "WARNING: Failed to fetch updates from git repo"
+        return 1
+    fi
+
+    # Check if we're behind
+    local local_hash remote_hash
+    local_hash=$(git rev-parse HEAD 2>/dev/null)
+    remote_hash=$(git rev-parse origin/master 2>/dev/null || git rev-parse origin/main 2>/dev/null)
+
+    if [[ "$local_hash" == "$remote_hash" ]]; then
+        # Already up to date
+        return 0
+    fi
+
+    log "Update available: $local_hash -> $remote_hash"
+
+    # Pull updates
+    if git pull origin master &>/dev/null || git pull origin main &>/dev/null; then
+        log "✅ Watchdog updated to latest version"
+        send_alert "🔄 Watchdog auto-updated from $local_hash to $remote_hash"
+        
+        # If running in loop mode, restart ourselves
+        if $LOOP_MODE; then
+            log "Restarting watchdog to apply updates..."
+            exec "$0" "$@"
+        fi
+    else
+        log "❌ Failed to pull updates from git repo"
         return 1
     fi
 }
@@ -268,7 +337,8 @@ archive_broken_config() {
     local next_num=1
     if ls "$BROKEN_DIR"/broken-*.json 1>/dev/null 2>&1; then
         next_num=$(ls "$BROKEN_DIR"/broken-*.json | sed 's/.*broken-\([0-9]*\).*/\1/' | sort -n | tail -1)
-        next_num=$((next_num + 1))
+        # Force base-10 to avoid octal interpretation of leading zeros
+        next_num=$((10#$next_num + 1))
     fi
 
     local padded
@@ -506,10 +576,33 @@ Last-known-good: <code>${LAST_GOOD}</code>"
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if $LOOP_MODE; then
-    log "Watchdog v${VERSION} starting in loop mode (interval: ${CHECK_INTERVAL}s)"
+    log "Watchdog v${VERSION} starting in loop mode (interval: ${CHECK_INTERVAL}s, max failures: ${MAX_CONSECUTIVE_FAILURES})"
+    
+    # Track last update check time
+    last_update_check=0
+    
     while true; do
         rotate_log
         run_check || true
+        
+        # Check if we've exceeded max consecutive failures
+        current_failures=$(get_failure_count)
+        if (( current_failures >= MAX_CONSECUTIVE_FAILURES )); then
+            log "❌ EXITING: Reached max consecutive failures (${current_failures}/${MAX_CONSECUTIVE_FAILURES})"
+            send_alert "🛑 Watchdog stopped after ${current_failures} consecutive recovery failures.
+
+Manual intervention required. Check logs at:
+<code>${LOG_FILE}</code>"
+            exit 1
+        fi
+        
+        # Check for updates periodically
+        current_time=$(date +%s)
+        if (( current_time - last_update_check >= UPDATE_CHECK_INTERVAL )); then
+            check_and_update || true
+            last_update_check=$current_time
+        fi
+        
         sleep "$CHECK_INTERVAL"
     done
 else
