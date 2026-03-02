@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -254,7 +254,7 @@ check_and_update() {
     # Check if we're behind
     local local_hash remote_hash
     local_hash=$(git rev-parse HEAD 2>/dev/null)
-    remote_hash=$(git rev-parse origin/master 2>/dev/null || git rev-parse origin/main 2>/dev/null)
+    remote_hash=$(git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null)
 
     if [[ "$local_hash" == "$remote_hash" ]]; then
         # Already up to date
@@ -263,10 +263,17 @@ check_and_update() {
 
     log "Update available: $local_hash -> $remote_hash"
 
-    # Pull updates
-    if git pull origin master &>/dev/null || git pull origin main &>/dev/null; then
+    # Pull updates and check if anything actually changed
+    local pull_output
+    pull_output=$(git pull origin main 2>&1 || git pull origin master 2>&1)
+    
+    # Check if the pull actually updated anything
+    local new_hash
+    new_hash=$(git rev-parse HEAD 2>/dev/null)
+    
+    if [[ "$new_hash" != "$local_hash" ]]; then
         log "✅ Watchdog updated to latest version"
-        send_alert "🔄 Watchdog auto-updated from $local_hash to $remote_hash"
+        send_alert "🔄 Watchdog auto-updated from $local_hash to $new_hash"
         
         # If running in loop mode, restart ourselves
         if $LOOP_MODE; then
@@ -274,8 +281,8 @@ check_and_update() {
             exec "$0" "$@"
         fi
     else
-        log "❌ Failed to pull updates from git repo"
-        return 1
+        log "Pull completed but no changes (already up to date)"
+        return 0
     fi
 }
 
